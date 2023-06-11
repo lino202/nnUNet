@@ -157,7 +157,9 @@ def multi_class_topological_post_processing(
         model        - Pre-trained CNN as PyTorch module (without final activation)
         prior        - Topological prior as dictionary:
                        keys are tuples specifying the channel(s) of inputs
-                       values are tuples specifying the desired Betti numbers
+                       values are tuples specifying the desired Betti numbers, 
+                       the betti number 0 for all channels/classes must be at least 1!
+                       then betti0 -> [1,inf] , betti1 [0, inf], betti2 [0,inf], and all can be -1 for designating doubt
         lr           - Learning rate for SGD optimiser
         mse_lambda   - Weighting for similarity constraint
         
@@ -300,14 +302,31 @@ def multi_class_topological_post_processing(
         # Select features for the construction of the topological loss
         stacked_prior = torch.stack(list(prior.values()))
         stacked_prior.T[0] -= 1 # Since fundamental 0D component has infinite persistence
-        matching = torch.zeros_like(bcodes).detach().bool()
+        matching = torch.zeros_like(bcodes, dtype=torch.uint8).detach()
+        
+        
+        #Normal
+        # for c, combo in enumerate(stacked_prior):
+        #     for dim in range(len(combo)):
+        #         matching[c, dim, slice(None, stacked_prior[c, dim])] = True
+
+        #Do not touch the ones I am not certain about the topo
+        #matching is not bool anymore know it is 
+        #0 = not matched/incorrect
+        #1 = correct
+        #2 = I do not know (so not correct no incorrect in loss)
+        bcodes_arr = bcodes.detach().cpu().numpy()
         for c, combo in enumerate(stacked_prior):
             for dim in range(len(combo)):
-                matching[c, dim, slice(None, stacked_prior[c, dim])] = True
+                if stacked_prior[c, dim] >= 0: # If user put -1 (dubious topo) this is minor to 0
+                    matching[c, dim, slice(None, stacked_prior[c, dim])] = 1
+                else:
+                    nTopos = np.count_nonzero(bcodes_arr[c,dim,:])
+                    matching[c, dim, slice(None, nTopos)] = 2
 
         # Find total persistence of features which match (A) / violate (Z) the prior
-        A = (1 - bcodes[matching]).sum()
-        Z = bcodes[~matching].sum()
+        A = (1 - bcodes[matching==1]).sum()
+        Z = bcodes[matching==0].sum()
 
         # Get similarity constraint
         mse = F.mse_loss(outputs, pred_unet)
