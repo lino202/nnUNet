@@ -193,11 +193,14 @@ def multi_class_topological_post_processing(
     isThereMvo = pred_unet.argmax(dim=0)
     if isThereMvo.max()==4:
         prior = priors[1]
-    elif isThereMvo.max()==3:
+    else: # isThereMvo.max()==3:
         prior = priors[0]
-    else:
-        raise ValueError('Class 3 MI is not present in prediction!!,' 
-        'Maybe add priors in case only a variable number of classes are present for test image')
+
+    if isThereMvo.max() < 3:
+        print('Class 3 MI is not present in prediction!!,Maybe add priors in case only a variable number of classes are present for test image')
+    # else:
+    #     raise ValueError('Class 3 MI is not present in prediction!!,' 
+    #     'Maybe add priors in case only a variable number of classes are present for test image')
 
     # If appropriate, choose ROI for topological consideration
     if thresh:
@@ -255,20 +258,22 @@ def multi_class_topological_post_processing(
             if saveCombosPath:
                 combosArr = combos.cpu().detach().numpy()
                 nImgs = combosArr.shape[0]+1
+                shown_slice = int(combosArr.shape[1]/2)
                 ncols=3
                 nrows = int(np.ceil(nImgs/ncols))
-                f, a = plt.subplots(nrows, ncols)
+                _, a = plt.subplots(nrows, ncols)
                 j=0
                 i=0
                 for nImg in range(nImgs-1):
-                    a[j,i].imshow(combosArr[nImg,10,:,:])
+                    a[j,i].imshow(combosArr[nImg,shown_slice,:,:])
                     a[j,i].axis('off')
                     i+=1
                     if i % ncols == 0: 
                         j += 1
                         i = 0
-                a[j,i].imshow(inputs[0,10,:,:])
+                a[j,i].imshow(inputs[roi][0,shown_slice,:,:])
                 plt.savefig(os.path.join(saveCombosPath, sample))
+                plt.close()
 
         # Invert probababilistic fields for consistency with cripser sub-level set persistence
         combos = 1 - combos
@@ -538,33 +543,40 @@ def predict_from_raw_data_ph(list_of_lists_or_source_folder: Union[str, List[Lis
                 thresh=phThres, parallel=phParallel
             )
 
-            if prediction is None:
-                prediction = predict_sliding_window_return_logits_ph(
-                    network_TP, data, num_seg_heads,
-                    configuration_manager.patch_size,
-                    mirror_axes=inference_allowed_mirroring_axes if use_mirroring else None,
-                    tile_step_size=tile_step_size,
-                    use_gaussian=use_gaussian,
-                    precomputed_gaussian=inference_gaussian,
-                    perform_everything_on_gpu=perform_everything_on_gpu,
-                    verbose=verbose,
-                    device=device)
-            else:
-                prediction += predict_sliding_window_return_logits_ph(
-                    network_TP, data, num_seg_heads,
-                    configuration_manager.patch_size,
-                    mirror_axes=inference_allowed_mirroring_axes if use_mirroring else None,
-                    tile_step_size=tile_step_size,
-                    use_gaussian=use_gaussian,
-                    precomputed_gaussian=inference_gaussian,
-                    perform_everything_on_gpu=perform_everything_on_gpu,
-                    verbose=verbose,
-                    device=device)
+            #Here we eval again without training
+            network_TP.eval()
+            with torch.no_grad():
+                if prediction is None:
+                    prediction = predict_sliding_window_return_logits_ph(
+                        network_TP, data, num_seg_heads,
+                        configuration_manager.patch_size,
+                        mirror_axes=inference_allowed_mirroring_axes if use_mirroring else None,
+                        tile_step_size=tile_step_size,
+                        use_gaussian=use_gaussian,
+                        precomputed_gaussian=inference_gaussian,
+                        perform_everything_on_gpu=perform_everything_on_gpu,
+                        verbose=verbose,
+                        device=device)
+                else:
+                    prediction += predict_sliding_window_return_logits_ph(
+                        network_TP, data, num_seg_heads,
+                        configuration_manager.patch_size,
+                        mirror_axes=inference_allowed_mirroring_axes if use_mirroring else None,
+                        tile_step_size=tile_step_size,
+                        use_gaussian=use_gaussian,
+                        precomputed_gaussian=inference_gaussian,
+                        perform_everything_on_gpu=perform_everything_on_gpu,
+                        verbose=verbose,
+                        device=device)
+            
+            del network_TP
+
         if len(parameters) > 1:
             prediction /= len(parameters)
 
         print('Prediction done, transferring to CPU if needed')
         prediction = prediction.detach().to('cpu').numpy()
+        torch.cuda.empty_cache()
         export_prediction_from_softmax(prediction, properties, configuration_manager, plans_manager, dataset_json, ofile, save_probabilities)
         print(f'done with {os.path.basename(ofile)} in {time.time()-start_image_pred_timer} s')
 
