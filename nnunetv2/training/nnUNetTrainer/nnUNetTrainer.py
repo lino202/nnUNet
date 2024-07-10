@@ -1358,6 +1358,179 @@ class nnUNetTrainer(object):
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
 
+
+    def perform_temp_scaling(self, save_probabilities: bool = False):
+        
+        # This code is based on perform_actual_validation, here we optimize the value of the temperature
+        from nnunetv2.training.temperature_scaling.temperature_scaling import ModelWithTemperature, _ECELoss, make_ece_diagrams
+        from torch import nn, optim
+        import torch.nn.functional as F
+        
+        self.set_deep_supervision_enabled(False)
+        self.network.eval()
+
+        if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
+            self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
+                                   "encounter crashes in validation then this is because torch.compile forgets "
+                                   "to trigger a recompilation of the model with deep supervision disabled. "
+                                   "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
+                                   "validation with --val (exactly the same as before) and then it will work. "
+                                   "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
+                                   "forward pass (where compile is triggered) already has deep supervision disabled. "
+                                   "This is exactly what we need in perform_actual_validation")
+
+        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+                                    perform_everything_on_device=True, device=self.device, verbose=False,
+                                    verbose_preprocessing=False, allow_tqdm=False)
+        predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+                                        self.dataset_json, self.__class__.__name__,
+                                        self.inference_allowed_mirroring_axes)
+
+        # We dropped multiprocessing for simpler code
+        validation_output_folder = join(self.output_folder, 'validation_temp_scaling')
+        maybe_mkdir_p(validation_output_folder)
+
+        # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
+        # the validation keys across the workers.
+        _, val_keys = self.do_split()
+        if self.is_ddp:
+            raise ("DDP is not implemented for temperature scaling")
+
+        dataset_val = nnUNetDataset(self.preprocessed_dataset_folder, val_keys,
+                                    folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
+                                    num_images_properties_loading_threshold=0)
+
+        next_stages = self.configuration_manager.next_stage_names
+        if next_stages is not None:
+            raise ("Next stages is not implemented for temperature scaling")
+
+        #  Tune temperature ----------------------------------------------------------------------------------------------------
+        # First we compute without the temperature tunning
+        nll_criterion = nn.CrossEntropyLoss().cuda()
+        ece_criterion = _ECELoss().cuda()
+        image_reader_writer = self.plans_manager.image_reader_writer_class()
+        
+        # First: collect all the logits and labels for the validation set
+        logits_list = []
+        labels_list = []
+        with torch.no_grad():
+            for i, k in enumerate(dataset_val.keys()):
+
+                self.print_to_log_file(f"predicting {k}")
+                data, seg, properties = dataset_val.load_case(k)
+
+                if self.is_cascaded:
+                    raise ("Cascaded is not implemented for temperature scaling")
+                    # data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels, output_dtype=data.dtype)))
+                with warnings.catch_warnings():
+                    # ignore 'The given NumPy array is not writable' warning
+                    warnings.simplefilter("ignore")
+                    data = torch.from_numpy(data)
+
+                # Get logits
+                prediction = predictor.predict_sliding_window_return_logits(data)
+                prediction = prediction.cpu().unsqueeze(0)
+                logits_list.append(prediction) # prediction here is = logits
+
+                # Get the gt labels
+                num_classes = self.label_manager.foreground_regions if self.label_manager.has_regions else self.label_manager.foreground_labels
+                num_classes = max(num_classes)+1
+                reference_file = os.path.join(self.preprocessed_dataset_folder_base, 'gt_segmentations', k+self.dataset_json["file_ending"])
+                seg_ref, seg_ref_dict = image_reader_writer.read_seg(reference_file)
+                seg_ref = torch.from_numpy(seg_ref).type(torch.LongTensor)
+                labels_list.append(seg_ref)
+
+            logits = torch.cat(logits_list).cuda()
+            labels = torch.cat(labels_list).cuda()
+            labels_one_hot = F.one_hot(labels, num_classes=num_classes)
+            labels_one_hot = labels_one_hot.permute(0, 4, 1, 2, 3).type(torch.FloatTensor).cuda()
+
+        # Calculate NLL and ECE before temperature scaling
+        before_temperature_nll = nll_criterion(logits, labels_one_hot).item()
+        before_temperature_ece = ece_criterion(logits, labels).item()
+        self.print_to_log_file('Before temperature - NLL: %.3f, ECE: %.3f' % (before_temperature_nll, before_temperature_ece), also_print_to_console=True)
+        make_ece_diagrams(logits, labels, os.path.join(validation_output_folder, 'before_temp_scaling.png'))
+
+        # Next: optimize the temperature --------------------------------------------------------------------------------------
+        # The self.network should be in eval (self.network training = False) so we do not change network/model parameters, 
+        # cause we only want to change the temperature parameter
+        self.network_temp_scaling = ModelWithTemperature(self.network).cuda()
+        optimizer = optim.LBFGS([self.network_temp_scaling.temperature], lr=0.01, max_iter=10000)
+
+        def eval():
+            optimizer.zero_grad()
+            # loss = nll_criterion(self.network_temp_scaling.temperature_scale(logits), labels_one_hot)
+            loss = ece_criterion(self.network_temp_scaling.temperature_scale(logits), labels)
+            loss.backward()
+            return loss
+        optimizer.step(eval)
+
+        # Calculate NLL and ECE after temperature scaling
+        after_temperature_nll = nll_criterion(self.network_temp_scaling.temperature_scale(logits), labels_one_hot).item()
+        after_temperature_ece = ece_criterion(self.network_temp_scaling.temperature_scale(logits), labels).item()
+        self.print_to_log_file('Optimal temperature: %.3f' % self.network_temp_scaling.temperature.item(), also_print_to_console=True)
+        self.print_to_log_file('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece), also_print_to_console=True)
+        make_ece_diagrams(self.network_temp_scaling.temperature_scale(logits), labels, os.path.join(validation_output_folder, 'after_temp_scaling.png'))
+
+        # Save the scaled network ---------------------------
+        # We add core_model_weights to compare with network weights of the checkpoint_final to check for no model variation
+        checkpoint = {
+            'network_weights': self.network_temp_scaling.state_dict(),
+            'core_model_weights': self.network_temp_scaling.model._orig_mod.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+            'logging': self.logger.get_checkpoint(),
+            '_best_ema': self._best_ema,
+            'current_epoch': self.current_epoch + 1,
+            'init_args': self.my_init_kwargs,
+            'trainer_name': self.__class__.__name__,
+            'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+        }
+        torch.save(checkpoint, os.path.join(self.output_folder, 'checkpoint_temperature_scaling.pth'))
+
+        # Recompute with the new model/network with temperature scaling ----------------------------------------------------------------------------------
+        # Now we replace network with network_temp_scaling for having the actual logits from the new scaled net
+        # We set all to eval and change the predictor net
+        self.network_temp_scaling.eval()
+        predictor.network = self.network_temp_scaling
+        
+        with torch.no_grad():
+            for i, k in enumerate(dataset_val.keys()):
+
+                self.print_to_log_file(f"predicting {k}")
+                data, seg, properties = dataset_val.load_case(k)
+
+                with warnings.catch_warnings():
+                    # ignore 'The given NumPy array is not writable' warning
+                    warnings.simplefilter("ignore")
+                    data = torch.from_numpy(data)
+                
+                output_filename_truncated = join(validation_output_folder, k)
+                prediction = predictor.predict_sliding_window_return_logits(data)
+                prediction = prediction.cpu()
+
+                export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
+                             self.dataset_json, output_filename_truncated, save_probabilities)
+
+        # These saved metrics should not vary from the validation/summary.json as we only scaled the logits
+        metrics = compute_metrics_on_folder(join(self.preprocessed_dataset_folder_base, 'gt_segmentations'),
+                                            validation_output_folder,
+                                            join(validation_output_folder, 'summary.json'),
+                                            self.plans_manager.image_reader_writer_class(),
+                                            self.dataset_json["file_ending"],
+                                            self.label_manager.foreground_regions if self.label_manager.has_regions else
+                                            self.label_manager.foreground_labels,
+                                            self.label_manager.ignore_label, chill=True,
+                                            num_processes=default_num_processes * dist.get_world_size() if
+                                            self.is_ddp else default_num_processes)
+        self.print_to_log_file("Validation complete", also_print_to_console=True)
+        self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
+                                also_print_to_console=True)
+
+        self.set_deep_supervision_enabled(True)
+        compute_gaussian.cache_clear()
+
+
     def run_training(self):
         self.on_train_start()
 

@@ -146,6 +146,7 @@ def run_training(dataset_name_or_id: Union[str, int],
                  export_validation_probabilities: bool = False,
                  continue_training: bool = False,
                  only_run_validation: bool = False,
+                 temp_scaling: bool = False,
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
                  device: torch.device = torch.device('cuda')):
@@ -212,7 +213,14 @@ def run_training(dataset_name_or_id: Union[str, int],
 
         if val_with_best:
             nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
-        nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+
+        if not temp_scaling:
+            nnunet_trainer.print_to_log_file("Performing temperature scaling--------------------------------------", also_print_to_console=True)
+            nnunet_trainer.perform_temp_scaling(export_validation_probabilities)
+        else:
+            nnunet_trainer.print_to_log_file("Performing default-original validation--------------------------------------", also_print_to_console=True)
+            nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+
 
 
 def run_training_entry():
@@ -244,6 +252,8 @@ def run_training_entry():
                         help='[OPTIONAL] Continue training from latest checkpoint')
     parser.add_argument('--val', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to only run the validation. Requires training to have finished.')
+    parser.add_argument('--temp_scaling', action='store_true', required=False,
+                        help='[OPTIONAL] Set this flag to scaled the final network to have also de the adjusted logits for adjusted certainty prediction')
     parser.add_argument('--val_best', action='store_true', required=False,
                         help='[OPTIONAL] If set, the validation will be performed with the checkpoint_best instead '
                              'of checkpoint_final. NOT COMPATIBLE with --disable_checkpointing! '
@@ -273,7 +283,7 @@ def run_training_entry():
         device = torch.device('mps')
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
-                 args.num_gpus, args.use_compressed, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
+                 args.num_gpus, args.use_compressed, args.npz, args.c, args.val, args.temp_scaling, args.disable_checkpointing, args.val_best,
                  device=device)
 
 
