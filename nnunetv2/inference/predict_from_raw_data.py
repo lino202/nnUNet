@@ -89,7 +89,11 @@ class nnUNetPredictor(object):
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
 
-            parameters.append(checkpoint['network_weights'])
+            if 'temperature_scaling' in checkpoint_name:
+                checkpoint['network_weights']['temperature'] = checkpoint['temperature']
+                parameters.append(checkpoint['network_weights'])
+            else:
+                parameters.append(checkpoint['network_weights'])
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
@@ -107,6 +111,11 @@ class nnUNetPredictor(object):
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
             enable_deep_supervision=False
         )
+
+        # If we use temp_scaling the network is different from the nnUnet default
+        if 'temperature_scaling' in checkpoint_name:
+            from nnunetv2.training.temperature_scaling.temperature_scaling import ModelWithTemperature
+            network = ModelWithTemperature(network)
 
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
@@ -481,7 +490,13 @@ class nnUNetPredictor(object):
 
             # messing with state dict names...
             if not isinstance(self.network, OptimizedModule):
-                self.network.load_state_dict(params)
+                if 'temperature' in params.keys():
+                    self.network.temperature = params['temperature']
+                    params_copy = deepcopy(params)
+                    del params_copy['temperature']
+                    self.network.model.load_state_dict(params_copy)
+                else:
+                    self.network.load_state_dict(params)
             else:
                 self.network._orig_mod.load_state_dict(params)
 

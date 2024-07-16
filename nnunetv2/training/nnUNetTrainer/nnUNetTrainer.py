@@ -1459,8 +1459,7 @@ class nnUNetTrainer(object):
 
         def eval():
             optimizer.zero_grad()
-            # loss = nll_criterion(self.network_temp_scaling.temperature_scale(logits), labels_one_hot)
-            loss = ece_criterion(self.network_temp_scaling.temperature_scale(logits), labels)
+            loss = nll_criterion(self.network_temp_scaling.temperature_scale(logits), labels_one_hot)
             loss.backward()
             return loss
         optimizer.step(eval)
@@ -1475,8 +1474,8 @@ class nnUNetTrainer(object):
         # Save the scaled network ---------------------------
         # We add core_model_weights to compare with network weights of the checkpoint_final to check for no model variation
         checkpoint = {
-            'network_weights': self.network_temp_scaling.state_dict(),
-            'core_model_weights': self.network_temp_scaling.model._orig_mod.state_dict(),
+            'network_weights': self.network_temp_scaling.model._orig_mod.state_dict(),
+            'temperature': self.network_temp_scaling.temperature,
             'optimizer_state': self.optimizer.state_dict(),
             'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
             'logging': self.logger.get_checkpoint(),

@@ -215,11 +215,12 @@ def run_training(dataset_name_or_id: Union[str, int],
             nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
 
         if not temp_scaling:
-            nnunet_trainer.print_to_log_file("Performing temperature scaling--------------------------------------", also_print_to_console=True)
-            nnunet_trainer.perform_temp_scaling(export_validation_probabilities)
-        else:
             nnunet_trainer.print_to_log_file("Performing default-original validation--------------------------------------", also_print_to_console=True)
             nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+        else:
+            nnunet_trainer.print_to_log_file("Performing temperature scaling--------------------------------------", also_print_to_console=True)
+            nnunet_trainer.perform_temp_scaling(export_validation_probabilities)
+            
 
 
 
