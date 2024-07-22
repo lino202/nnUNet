@@ -219,7 +219,7 @@ def run_training(dataset_name_or_id: Union[str, int],
             nnunet_trainer.perform_actual_validation(export_validation_probabilities)
         else:
             nnunet_trainer.print_to_log_file("Performing temperature scaling--------------------------------------", also_print_to_console=True)
-            nnunet_trainer.perform_temp_scaling(export_validation_probabilities)
+            nnunet_trainer.perform_temp_scaling(export_validation_probabilities, val_with_best)
             
 
 

@@ -6,17 +6,23 @@ import numpy as np
 
 def make_ece_diagrams(outputs, labels, file_path, n_bins=10):
     """
-    outputs - a torch tensor (size n x num_classes) with the outputs from the final linear layer
+    outputs - list with the torch tensors for predictions logits
     - NOT the softmaxes
-    labels - a torch tensor (size n) with the labels
-    """
-    labels = labels.detach().cpu()
-    outputs = outputs.detach().cpu()
+    labels - list with the torch tensors for gt labels
+    """ 
 
-    softmaxes = F.softmax(outputs, 1)
-    confidences, predictions = torch.max(softmaxes, 1)
-    accuracies = torch.eq(predictions, labels)
-    # overall_accuracy = (predictions==labels).sum().item()/len(labels)
+    confidences = None
+    accuracies = None
+    for i in range(len(outputs)):
+        i_label = labels[i].detach().cpu()
+        i_output = outputs[i].detach().cpu()
+
+        i_softmaxes = F.softmax(i_output, 1)
+        i_confidences, i_prediction = torch.max(i_softmaxes, 1)
+        i_accuracies = torch.eq(i_prediction, i_label)
+
+        confidences = torch.cat((confidences, i_confidences.flatten())) if confidences!=None else i_confidences.flatten()
+        accuracies  = torch.cat((accuracies, i_accuracies.flatten())) if accuracies!=None else i_accuracies.flatten()
     
     # Reliability diagram
     bins = torch.linspace(0, 1, n_bins + 1)
@@ -39,11 +45,13 @@ def make_ece_diagrams(outputs, labels, file_path, n_bins=10):
     plt.legend([confs, gaps], ['Accuracy', 'Gap'], loc='upper left', fontsize='x-large')
 
     ece = _ECELoss()
-    ece_value = ece(outputs, labels)
+    ece_values = np.zeros(len(outputs))
+    for i in range(len(outputs)):
+        ece_values[i] = ece(outputs[i], labels[i]).item()
 
     # Clean up
     bbox_props = dict(boxstyle="square", fc="lightgrey", ec="gray", lw=1.5)
-    plt.text(0.17, 0.82, "ECE: {:.4f}".format(ece_value.item()), ha="center", va="center", size=20, weight = 'normal', bbox=bbox_props)
+    plt.text(0.17, 0.82, "ECE: {:.4f}".format(np.mean(ece_values)), ha="center", va="center", size=20, weight = 'normal', bbox=bbox_props)
     plt.title("Reliability Diagram", size=22)
     plt.ylabel("Accuracy",  size=18)
     plt.xlabel("Confidence",  size=18)

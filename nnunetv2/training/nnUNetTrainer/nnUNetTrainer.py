@@ -1359,12 +1359,13 @@ class nnUNetTrainer(object):
         compute_gaussian.cache_clear()
 
 
-    def perform_temp_scaling(self, save_probabilities: bool = False):
+    def perform_temp_scaling(self, save_probabilities: bool = False, val_best: bool = False):
         
         # This code is based on perform_actual_validation, here we optimize the value of the temperature
         from nnunetv2.training.temperature_scaling.temperature_scaling import ModelWithTemperature, _ECELoss, make_ece_diagrams
         from torch import nn, optim
         import torch.nn.functional as F
+        import copy
         
         self.set_deep_supervision_enabled(False)
         self.network.eval()
@@ -1387,7 +1388,10 @@ class nnUNetTrainer(object):
                                         self.inference_allowed_mirroring_axes)
 
         # We dropped multiprocessing for simpler code
-        validation_output_folder = join(self.output_folder, 'validation_temp_scaling')
+        if val_best:
+            validation_output_folder = join(self.output_folder, 'validation_best_temp_scaling')
+        else:
+            validation_output_folder = join(self.output_folder, 'validation_final_temp_scaling')
         maybe_mkdir_p(validation_output_folder)
 
         # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
@@ -1430,26 +1434,34 @@ class nnUNetTrainer(object):
                 # Get logits
                 prediction = predictor.predict_sliding_window_return_logits(data)
                 prediction = prediction.cpu().unsqueeze(0)
-                logits_list.append(prediction) # prediction here is = logits
+                logits_list.append(prediction.cuda()) # prediction here is = logits
 
-                # Get the gt labels
-                num_classes = self.label_manager.foreground_regions if self.label_manager.has_regions else self.label_manager.foreground_labels
-                num_classes = max(num_classes)+1
-                reference_file = os.path.join(self.preprocessed_dataset_folder_base, 'gt_segmentations', k+self.dataset_json["file_ending"])
-                seg_ref, seg_ref_dict = image_reader_writer.read_seg(reference_file)
-                seg_ref = torch.from_numpy(seg_ref).type(torch.LongTensor)
-                labels_list.append(seg_ref)
-
-            logits = torch.cat(logits_list).cuda()
-            labels = torch.cat(labels_list).cuda()
-            labels_one_hot = F.one_hot(labels, num_classes=num_classes)
-            labels_one_hot = labels_one_hot.permute(0, 4, 1, 2, 3).type(torch.FloatTensor).cuda()
+                # Get the gt labels, labels come from the dataset which are already proccessed (cropped, padded, etc) but some voxels have -1 value 
+                # https://github.com/MIC-DKFZ/nnUNet/issues/2054
+                # Basically this serves for using the -1 values to know the amount of cropping and decide how to apply the Z-Score norm,
+                # moreover, the training and validation steps are computing a loss with the label, gt or here called target with ranges [0, num_classes-1]
+                # not [-1, num_classes-1], so we put the values again to 0 for been consistent in the calculation of the temp scaling
+                seg_ref = np.asarray(copy.deepcopy(seg)) # we need to copy as flags are = writtable: False
+                seg_ref[seg_ref<0] = 0            # we drop the -1 in the segmentation gt file
+                seg_ref = torch.from_numpy(seg_ref).type(torch.LongTensor)        
+                labels_list.append(seg_ref.cuda())
 
         # Calculate NLL and ECE before temperature scaling
-        before_temperature_nll = nll_criterion(logits, labels_one_hot).item()
-        before_temperature_ece = ece_criterion(logits, labels).item()
-        self.print_to_log_file('Before temperature - NLL: %.3f, ECE: %.3f' % (before_temperature_nll, before_temperature_ece), also_print_to_console=True)
-        make_ece_diagrams(logits, labels, os.path.join(validation_output_folder, 'before_temp_scaling.png'))
+        num_classes = self.label_manager.foreground_regions if self.label_manager.has_regions else self.label_manager.foreground_labels
+        num_classes = max(num_classes)+1
+        n_samples = len(logits_list)
+        before_temperature_nll = np.zeros(n_samples)
+        before_temperature_ece = np.zeros(n_samples)
+        labels_one_hots = []
+        for i in range(n_samples):
+            labels_one_hot = F.one_hot(labels_list[i], num_classes=num_classes)
+            labels_one_hot = labels_one_hot.permute(0, 4, 1, 2, 3).type(torch.FloatTensor).cuda()
+            labels_one_hots.append(labels_one_hot)
+        
+            before_temperature_nll[i] = nll_criterion(logits_list[i], labels_one_hot).item()
+            before_temperature_ece[i] = ece_criterion(logits_list[i], labels_list[i]).item()
+        self.print_to_log_file('Before temperature - NLL: %.3f, ECE: %.3f' % (np.mean(before_temperature_nll), np.mean(before_temperature_ece)), also_print_to_console=True)
+        make_ece_diagrams(logits_list, labels_list, os.path.join(validation_output_folder, 'before_temp_scaling.png'))
 
         # Next: optimize the temperature --------------------------------------------------------------------------------------
         # The self.network should be in eval (self.network training = False) so we do not change network/model parameters, 
@@ -1459,17 +1471,31 @@ class nnUNetTrainer(object):
 
         def eval():
             optimizer.zero_grad()
-            loss = nll_criterion(self.network_temp_scaling.temperature_scale(logits), labels_one_hot)
-            loss.backward()
-            return loss
+            loss_tot = None
+            for i in range(n_samples):
+                loss = nll_criterion(self.network_temp_scaling.temperature_scale(logits_list[i]), labels_one_hots[i])
+                if loss_tot == None:
+                    loss_tot = loss
+                else:
+                    loss_tot += loss
+            loss_tot = loss_tot / n_samples
+            loss_tot.backward()
+            return loss_tot
         optimizer.step(eval)
 
         # Calculate NLL and ECE after temperature scaling
-        after_temperature_nll = nll_criterion(self.network_temp_scaling.temperature_scale(logits), labels_one_hot).item()
-        after_temperature_ece = ece_criterion(self.network_temp_scaling.temperature_scale(logits), labels).item()
+        after_temperature_nll = np.zeros(n_samples)
+        after_temperature_ece = np.zeros(n_samples)
+        temp_scaled_logits_list = []
+        for i in range(n_samples):
+            current_sample_temp_scaled = self.network_temp_scaling.temperature_scale(logits_list[i])
+            temp_scaled_logits_list.append(current_sample_temp_scaled)
+            after_temperature_nll[i] = nll_criterion(current_sample_temp_scaled, labels_one_hots[i]).item()
+            after_temperature_ece[i] = ece_criterion(current_sample_temp_scaled, labels_list[i]).item()  
+        
         self.print_to_log_file('Optimal temperature: %.3f' % self.network_temp_scaling.temperature.item(), also_print_to_console=True)
-        self.print_to_log_file('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece), also_print_to_console=True)
-        make_ece_diagrams(self.network_temp_scaling.temperature_scale(logits), labels, os.path.join(validation_output_folder, 'after_temp_scaling.png'))
+        self.print_to_log_file('After temperature - NLL: %.3f, ECE: %.3f' % (np.mean(after_temperature_nll), np.mean(after_temperature_ece)), also_print_to_console=True)
+        make_ece_diagrams(temp_scaled_logits_list, labels_list, os.path.join(validation_output_folder, 'after_temp_scaling.png'))
 
         # Save the scaled network ---------------------------
         # We add core_model_weights to compare with network weights of the checkpoint_final to check for no model variation
@@ -1485,7 +1511,10 @@ class nnUNetTrainer(object):
             'trainer_name': self.__class__.__name__,
             'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
         }
-        torch.save(checkpoint, os.path.join(self.output_folder, 'checkpoint_temperature_scaling.pth'))
+        if val_best:
+            torch.save(checkpoint, os.path.join(self.output_folder, 'checkpoint_best_temperature_scaling.pth'))
+        else:
+            torch.save(checkpoint, os.path.join(self.output_folder, 'checkpoint_final_temperature_scaling.pth'))
 
         # Recompute with the new model/network with temperature scaling ----------------------------------------------------------------------------------
         # Now we replace network with network_temp_scaling for having the actual logits from the new scaled net
