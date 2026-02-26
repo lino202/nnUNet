@@ -357,7 +357,17 @@ class nnUNetPredictorPH(nnUNetPredictor):
                     self.network.model = postPH_model_net
 
                 else:
+                    # Here we apply PH without temperature, self.network is already the one without temp so we just load the state dict
                     self.network.load_state_dict(params)
+
+                    #We need to retrain the net for this fold to have persistent homology
+                    phResPath = os.path.join(ofolder,"fold_{}".format(i))
+                    if not os.path.exists(phResPath): pathlib.Path(phResPath).mkdir(parents=True, exist_ok=True)
+                    self.multi_class_topological_post_processing(
+                        inputs=data, 
+                        resPath=phResPath,
+                    )
+                    # self.network is already the one without temp and retrained with PH  
             else:
                 # self.network._orig_mod.load_state_dict(params)
                 raise ValueError("You should not be here!")
